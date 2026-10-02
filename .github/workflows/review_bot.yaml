@@ -1,0 +1,56 @@
+name: Review recent forecasts
+
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "How many days back to look for resolved questions"
+        default: "30"
+  schedule:
+    - cron: "0 6 * * 1" # weekly, Monday morning
+
+# Add concurrency group to prevent parallel runs
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+# Scores how the bot's resolved forecasts turned out. Read-only: it makes no
+# forecasts, spends nothing on LLMs, and publishes nothing.
+# The weekly run is off by default: set the repository variable REVIEW_BOT_ENABLED to
+# true to turn it on. Running it by hand always works.
+jobs:
+  review_job:
+    if: vars.REVIEW_BOT_ENABLED == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install poetry
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+          installer-parallel: true
+      - name: Install dependencies
+        run: poetry install --no-interaction --no-root --with integrations
+      - name: Review forecasts
+        run: |
+          poetry run bot-review review \
+            --resolved-since ${{ inputs.days || 30 }} \
+            --output review.json \
+            --summary review.md
+        env:
+          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
+      - name: Show the summary in the run page
+        run: cat review.md >> $GITHUB_STEP_SUMMARY
+      - name: Keep the review
+        uses: actions/upload-artifact@v4
+        with:
+          name: review
+          path: |
+            review.json
+            review.md
+          retention-days: 90
