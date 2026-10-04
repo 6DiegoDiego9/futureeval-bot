@@ -1,9 +1,11 @@
 import argparse
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Literal
 
+import anthropic
 import dotenv
 
 # Runtime helpers (env validation, banners, dependency-warning suppression).
@@ -39,6 +41,9 @@ from forecasting_tools import (
     SmartSearcher,
     clean_indents,
     structure_output,
+)
+from forecasting_tools.ai_models.resource_managers.monetary_cost_manager import (
+    MonetaryCostManager,
 )
 
 dotenv.load_dotenv()
@@ -156,12 +161,78 @@ class FallTemplateBot2026(ForecastBot):
                     use_advanced_filters=False,
                 )
                 research = await searcher.invoke(prompt)
+            elif researcher.startswith("anthropic-web/"):
+                research, cost = await asyncio.to_thread(
+                    self._anthropic_web_research,
+                    researcher.removeprefix("anthropic-web/"),
+                    prompt,
+                )
+                MonetaryCostManager.increase_current_usage_in_parent_managers(cost)
             elif not researcher or researcher == "None" or researcher == "no_research":
                 research = ""
             else:
                 research = await self.get_llm("researcher", "llm").invoke(prompt)
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
+
+    # USD per million tokens (input, output) and per web search, for cost logging
+    _ANTHROPIC_PRICES = {
+        "claude-haiku-4-5": (1.0, 5.0),
+        "claude-sonnet-5-5": (2.0, 10.0),
+    }
+    _WEB_SEARCH_PRICE = 0.01
+    _WEB_SEARCH_MAX_USES = 2
+
+    def _anthropic_web_research(self, model: str, prompt: str) -> tuple[str, float]:
+        """
+        Research with Claude and Anthropic's server-side web search tool.
+        Returns the research text and its cost in USD. Searches are capped at
+        _WEB_SEARCH_MAX_USES per question because search results are billed as
+        input tokens and dominate the cost of a question.
+        """
+        client = anthropic.Anthropic()
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        messages: list = [
+            {
+                "role": "user",
+                "content": f"Today's date is {today}. Search the web for the latest information.\n\n{prompt}",
+            }
+        ]
+        tool_type = (
+            "web_search_20250305" if "haiku" in model else "web_search_20260209"
+        )
+        tools = [
+            {
+                "type": tool_type,
+                "name": "web_search",
+                "max_uses": self._WEB_SEARCH_MAX_USES,
+            }
+        ]
+        price_in, price_out = self._ANTHROPIC_PRICES[model]
+        text, cost, searches = "", 0.0, 0
+        for _ in range(3):  # pause_turn continuations
+            response = client.messages.create(
+                model=model, max_tokens=8000, tools=tools, messages=messages
+            )
+            usage = response.usage
+            n_searches = getattr(usage.server_tool_use, "web_search_requests", 0) or 0
+            searches += n_searches
+            cost += (
+                usage.input_tokens * price_in
+                + (usage.cache_creation_input_tokens or 0) * price_in * 1.25
+                + (usage.cache_read_input_tokens or 0) * price_in * 0.1
+                + usage.output_tokens * price_out
+            ) / 1e6 + n_searches * self._WEB_SEARCH_PRICE
+            text += "".join(b.text for b in response.content if b.type == "text")
+            if response.stop_reason != "pause_turn":
+                break
+            messages = messages[:1] + [
+                {"role": "assistant", "content": response.content}
+            ]
+        logger.info(
+            f"Anthropic web research: {model}, {searches} searches, cost ${cost:.4f}"
+        )
+        return text, cost
 
     @staticmethod
     def _get_research_prompt(
@@ -704,28 +775,40 @@ if __name__ == "__main__":
     publish_to_metaculus = True
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
-    # Configure the bot. The `llms=` block below is commented out to use
-    # whichever default models forecasting-tools picks based on your env vars;
-    # uncomment and edit to pin specific models.
+    # Models are pinned to Anthropic (ANTHROPIC_API_KEY). Claude Sonnet 5.5
+    # rejects a non-default temperature and a thinking budget, so the forecaster
+    # sets neither and controls depth with output_config.effort.
+    # Measured cost per question: ~$0.04 research + ~$0.02 per prediction, so
+    # 3 predictions (~$0.10 per question) keep the season within the budget.
+    # The cheap model (parsing, summaries) moves to Gemini Flash once a
+    # sponsored OpenRouter key is set; until then Claude Haiku 4.5.
+    cheap_model = (
+        "openrouter/~google/gemini-flash-latest"
+        if os.getenv("OPENROUTER_API_KEY")
+        else "anthropic/claude-haiku-4-5"
+    )
     template_bot = FallTemplateBot2026(
         research_reports_per_question=1,
-        predictions_per_research_report=5,
+        predictions_per_research_report=3,
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=publish_to_metaculus,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
-        # llms={
-        #     "default": GeneralLlm(
-        #         model="openrouter/openai/gpt-4o",
-        #         temperature=0.3,
-        #         timeout=40,
-        #         allowed_tries=2,
-        #     ),
-        #     "summarizer": "openai/gpt-4o-mini",
-        #     "researcher": "asknews/news-summaries",
-        #     "parser": "openai/gpt-4o-mini",
-        # },
+        llms={
+            "default": GeneralLlm(
+                model="anthropic/claude-sonnet-5-5",
+                timeout=300,
+                allowed_tries=2,
+                max_tokens=16000,
+                output_config={"effort": "low"},
+            ),
+            "summarizer": GeneralLlm(
+                model=cheap_model, timeout=120, allowed_tries=2
+            ),
+            "researcher": "anthropic-web/claude-haiku-4-5",
+            "parser": GeneralLlm(model=cheap_model, timeout=120, allowed_tries=2),
+        },
     )
 
     # Per-mode tournament URL shown in the summary banner footer. These
