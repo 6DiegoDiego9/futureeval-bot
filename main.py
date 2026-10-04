@@ -775,34 +775,44 @@ if __name__ == "__main__":
     publish_to_metaculus = True
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
-    # Models are pinned to Anthropic (ANTHROPIC_API_KEY). Claude Sonnet 5.5
-    # rejects a non-default temperature and a thinking budget, so the forecaster
-    # sets neither and controls depth with output_config.effort.
-    # Measured cost per question: ~$0.04 research + ~$0.02 per prediction, so
-    # 3 predictions (~$0.10 per question) keep the season within the budget.
-    # The cheap model (parsing, summaries) moves to Gemini Flash once a
-    # sponsored OpenRouter key is set; until then Claude Haiku 4.5.
-    cheap_model = (
-        "openrouter/~google/gemini-flash-latest"
-        if os.getenv("OPENROUTER_API_KEY")
-        else "anthropic/claude-haiku-4-5"
-    )
+    # Research always runs on Anthropic (ANTHROPIC_API_KEY) with web search.
+    # With the sponsored OpenRouter key, forecasts (Claude Sonnet 5.5) and the
+    # cheap model (Gemini Flash) run on OpenRouter, so each budget covers the
+    # season: ~$0.04 research per question on one, ~$0.02 per prediction on the
+    # other. Without it everything runs on Anthropic with 3 predictions.
+    # Claude Sonnet 5.5 rejects a non-default temperature and a thinking budget:
+    # depth is set with effort (output_config direct, reasoning_effort via OpenRouter).
+    # Note: litellm has no OpenRouter price for Sonnet 5.5, so logged costs omit it.
+    if os.getenv("OPENROUTER_API_KEY"):
+        cheap_model = "openrouter/~google/gemini-flash-latest"
+        forecaster = GeneralLlm(
+            model="openrouter/anthropic/claude-sonnet-5-5",
+            timeout=300,
+            allowed_tries=2,
+            max_tokens=16000,
+            reasoning_effort="low",
+        )
+        predictions = 5
+    else:
+        cheap_model = "anthropic/claude-haiku-4-5"
+        forecaster = GeneralLlm(
+            model="anthropic/claude-sonnet-5-5",
+            timeout=300,
+            allowed_tries=2,
+            max_tokens=16000,
+            output_config={"effort": "low"},
+        )
+        predictions = 3
     template_bot = FallTemplateBot2026(
         research_reports_per_question=1,
-        predictions_per_research_report=3,
+        predictions_per_research_report=predictions,
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=publish_to_metaculus,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
         llms={
-            "default": GeneralLlm(
-                model="anthropic/claude-sonnet-5-5",
-                timeout=300,
-                allowed_tries=2,
-                max_tokens=16000,
-                output_config={"effort": "low"},
-            ),
+            "default": forecaster,
             "summarizer": GeneralLlm(
                 model=cheap_model, timeout=120, allowed_tries=2
             ),
