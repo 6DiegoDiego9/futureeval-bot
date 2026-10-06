@@ -776,15 +776,19 @@ if __name__ == "__main__":
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
     # Research always runs on Anthropic (ANTHROPIC_API_KEY) with web search.
-    # With the sponsored OpenRouter key, forecasts (Claude Sonnet 5.5) and the
-    # cheap model (Gemini Flash) run on OpenRouter, so each budget covers the
-    # season: ~$0.04 research per question on one, ~$0.02 per prediction on the
-    # other. Without it everything runs on Anthropic with 3 predictions.
+    # With the sponsored OpenRouter key, forecasts (Claude Sonnet 5.5) run on
+    # OpenRouter, so each budget covers the season: ~$0.04 research per question
+    # on one, ~$0.02 per prediction on the other. Without it everything runs on
+    # Anthropic with 3 predictions.
+    # The cheap model (parser, summarizer) is Claude Haiku 4.5 on Anthropic in
+    # both cases: Gemini Flash through the sponsored key is served by a Google AI
+    # Studio key on the free tier (20 requests/day), which returned 429/503 and
+    # failed 7 consecutive runs on 2026-10-05 ("only got 1 successful prediction").
     # Claude Sonnet 5.5 rejects a non-default temperature and a thinking budget:
     # depth is set with effort (output_config direct, reasoning_effort via OpenRouter).
     # Note: litellm has no OpenRouter price for Sonnet 5.5, so logged costs omit it.
+    cheap_model = "anthropic/claude-haiku-4-5"
     if os.getenv("OPENROUTER_API_KEY"):
-        cheap_model = "openrouter/~google/gemini-flash-latest"
         forecaster = GeneralLlm(
             model="openrouter/anthropic/claude-sonnet-5-5",
             timeout=300,
@@ -794,7 +798,6 @@ if __name__ == "__main__":
         )
         predictions = 5
     else:
-        cheap_model = "anthropic/claude-haiku-4-5"
         forecaster = GeneralLlm(
             model="anthropic/claude-sonnet-5-5",
             timeout=300,
