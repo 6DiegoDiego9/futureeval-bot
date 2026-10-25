@@ -27,7 +27,7 @@ jobs:
           virtualenvs-in-project: true
           installer-parallel: true
       - name: Install dependencies
-        run: poetry install --no-interaction --no-root
+        run: poetry install --no-interaction --no-root --without dev
       - name: Run bot
         run: |
           poetry run python main.py --mode metaculus_cup
